@@ -1,5 +1,6 @@
 import os
 from dataclasses import dataclass
+from typing import Optional
 
 from sqlglot import exp, parse
 
@@ -131,13 +132,86 @@ def get_tables(sql, dialect="duckdb") -> list[str]:
     return list(set([t for t in all_tables if t not in ctes]))
 
 
+@dataclass(frozen=True)
+class Relation:
+    schema: str
+    name: str
+    database: Optional[str] = None
+
+    @property
+    def canonical_name(self) -> str:
+        parts = [self.schema, self.name]
+        if self.database:
+            parts.insert(0, self.database)
+        return ".".join(parts)
+
+    @property
+    def schema_identifier(self) -> str:
+        if self.database:
+            return f"{self.database}.{self.schema}"
+        return self.schema
+
+    def qualify(self, table_name: str) -> str:
+        parts = [table_name]
+        if self.schema:
+            parts.insert(0, self.schema)
+        if self.database:
+            parts.insert(0, self.database)
+        return ".".join(parts)
+
+
 @dataclass
 class Dependency:
     deps: list[str]
     filename: str
+    relation: Relation
 
 
-def get_dependencies(folder, dialect="duckdb") -> dict:
+def _relation_from_filename(
+    folder: str,
+    filename: str,
+    default_schema: str,
+    infer_namespaces: bool,
+) -> Relation:
+    relative = os.path.relpath(os.path.dirname(filename), folder)
+    table_name = os.path.splitext(os.path.basename(filename))[0]
+
+    if not infer_namespaces:
+        return Relation(schema=default_schema, name=table_name)
+
+    if relative in (".", ""):
+        return Relation(schema=default_schema, name=table_name)
+
+    parts = [part for part in relative.split(os.sep) if part]
+
+    if len(parts) == 1:
+        return Relation(schema=parts[0], name=table_name)
+    if len(parts) == 2:
+        return Relation(database=parts[0], schema=parts[1], name=table_name)
+    if len(parts) > 2:
+        raise ValueError(
+            "SQL files can be nested in at most two directories (database/schema)."
+        )
+
+    return Relation(schema=default_schema, name=table_name)
+
+
+def _canonicalize_dependency_names(raw_names: list[str], relation: Relation) -> list[str]:
+    canonical: set[str] = set()
+    for name in raw_names:
+        if "." not in name:
+            canonical.add(relation.qualify(name))
+        else:
+            canonical.add(name)
+    return sorted(canonical)
+
+
+def get_dependencies(
+    folder,
+    dialect: str = "duckdb",
+    default_schema: str = "main",
+    infer_namespaces: bool = True,
+) -> dict:
     """
     Get the dependencies of the files (SQL or Python) in the given folder.
 
@@ -147,11 +221,25 @@ def get_dependencies(folder, dialect="duckdb") -> dict:
              SQL queries as values.
     """
     dependencies = {}
+    effective_default_schema = default_schema or "main"
+
     for dirpath, dirnames, filenames in os.walk(folder):
         for file in filenames:
             name, ext = os.path.splitext(file)
             if ext == ".sql" or ext == ".py":
                 filename = os.path.join(dirpath, file)
+                relation = _relation_from_filename(
+                    folder,
+                    filename,
+                    effective_default_schema,
+                    infer_namespaces=infer_namespaces,
+                )
                 sql = read_sql(filename)
-                dependencies[name] = Dependency(deps=get_tables(sql, dialect), filename=filename)
+                tables = get_tables(sql, dialect)
+                deps = _canonicalize_dependency_names(tables, relation)
+                dependencies[relation.canonical_name] = Dependency(
+                    deps=deps,
+                    filename=filename,
+                    relation=relation,
+                )
     return dependencies

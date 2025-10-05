@@ -2,7 +2,6 @@ import pytest
 from sqlglot import exp
 
 from yato.parser import (
-    Dependency,
     find_select_query,
     get_dependencies,
     get_table_name,
@@ -105,8 +104,71 @@ def test_get_tables():
 
 
 def test_get_dependencies():
-    deps = get_dependencies("tests/files/case0")
+    deps = get_dependencies("tests/files/case0", default_schema="main")
     assert len(deps) == 2
-    assert frozenset(deps.keys()) == frozenset(["table0", "table1"])
-    assert deps["table0"] == Dependency(deps=["source_orders"], filename="tests/files/case0/table0.sql")
-    assert deps["table1"] == Dependency(deps=["table0"], filename="tests/files/case0/table1.sql")
+    assert frozenset(deps.keys()) == frozenset(["main.table0", "main.table1"])
+
+    table0 = deps["main.table0"]
+    assert table0.deps == ["main.source_orders"]
+    assert table0.filename == "tests/files/case0/table0.sql"
+    assert table0.relation.schema == "main"
+    assert table0.relation.name == "table0"
+    assert table0.relation.canonical_name == "main.table0"
+
+    table1 = deps["main.table1"]
+    assert table1.deps == ["main.table0"]
+    assert table1.filename == "tests/files/case0/table1.sql"
+    assert table1.relation.schema == "main"
+    assert table1.relation.name == "table1"
+
+
+def test_get_dependencies_with_hierarchy(tmp_path):
+    (tmp_path / "warehouse" / "analytics").mkdir(parents=True)
+
+    (tmp_path / "inventory.sql").write_text("SELECT 1", encoding="utf-8")
+    (tmp_path / "warehouse" / "analytics" / "customers.sql").write_text(
+        "SELECT 1", encoding="utf-8"
+    )
+    (tmp_path / "warehouse" / "analytics" / "orders.sql").write_text(
+        "SELECT * FROM customers", encoding="utf-8"
+    )
+
+    deps = get_dependencies(tmp_path, default_schema="main")
+
+    assert set(deps.keys()) == {
+        "main.inventory",
+        "warehouse.analytics.customers",
+        "warehouse.analytics.orders",
+    }
+
+    orders = deps["warehouse.analytics.orders"]
+    assert orders.relation.database == "warehouse"
+    assert orders.relation.schema == "analytics"
+    assert orders.deps == ["warehouse.analytics.customers"]
+
+
+def test_get_dependencies_rejects_deep_nesting(tmp_path):
+    deep_dir = tmp_path / "a" / "b" / "c"
+    deep_dir.mkdir(parents=True)
+    (deep_dir / "table.sql").write_text("SELECT 1", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="at most two directories"):
+        get_dependencies(tmp_path, default_schema="main")
+
+
+def test_get_dependencies_without_namespace_inference(tmp_path):
+    target_dir = tmp_path / "analytics"
+    target_dir.mkdir()
+
+    (target_dir / "orders.sql").write_text("SELECT 1", encoding="utf-8")
+
+    deps = get_dependencies(
+        tmp_path,
+        default_schema="main",
+        infer_namespaces=False,
+    )
+
+    assert set(deps.keys()) == {"main.orders"}
+    relation = deps["main.orders"].relation
+    assert relation.schema == "main"
+    assert relation.database is None

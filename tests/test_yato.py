@@ -68,7 +68,7 @@ class TestYato(unittest.TestCase):
 
             con, _ = yato.run()
             rows = con.sql(
-                "SELECT id, payload FROM transform.orders ORDER BY id"
+                "SELECT id, payload FROM main.orders ORDER BY id"
             ).fetchall()
             self.assertEqual(rows, [(1, "first"), (2, "second")])
 
@@ -91,7 +91,7 @@ class TestYato(unittest.TestCase):
 
             con, _ = yato.run()
             rows = con.sql(
-                "SELECT id, payload FROM transform.orders ORDER BY id"
+                "SELECT id, payload FROM main.orders ORDER BY id"
             ).fetchall()
             self.assertEqual(
                 rows,
@@ -101,3 +101,100 @@ class TestYato(unittest.TestCase):
                     (3, "third"),
                 ],
             )
+
+    def test_schema_inferred_from_folder(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            sql_dir = os.path.join(tmp_dir, "sql")
+            analytics_dir = os.path.join(sql_dir, "analytics")
+            os.makedirs(analytics_dir, exist_ok=True)
+
+            customers_path = os.path.join(sql_dir, "customers.sql")
+            with open(customers_path, "w", encoding="utf-8") as customers_file:
+                customers_file.write(
+                    textwrap.dedent(
+                        """
+                        SELECT *
+                        FROM (
+                            VALUES (1, 'Alice'), (2, 'Bob')
+                        ) AS t(id, name)
+                        """
+                    ).strip()
+                )
+
+            orders_path = os.path.join(analytics_dir, "orders.sql")
+            with open(orders_path, "w", encoding="utf-8") as orders_file:
+                orders_file.write(
+                    textwrap.dedent(
+                        """
+                        SELECT id, name
+                        FROM main.customers
+                        """
+                    ).strip()
+                )
+
+            database_path = os.path.join(tmp_dir, "db.duckdb")
+            yato = Yato(
+                database_path=database_path,
+                sql_folder=sql_dir,
+            )
+
+            con, _ = yato.run()
+            try:
+                customers = con.sql("SELECT COUNT(*) FROM main.customers").fetchone()[0]
+                orders = con.sql(
+                    "SELECT name FROM analytics.orders ORDER BY id"
+                ).fetchall()
+
+                self.assertEqual(customers, 2)
+                self.assertEqual(orders, [("Alice",), ("Bob",)])
+            finally:
+                con.close()
+
+    def test_namespace_inference_can_be_disabled(self):
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            sql_dir = os.path.join(tmp_dir, "sql")
+            analytics_dir = os.path.join(sql_dir, "analytics")
+            os.makedirs(analytics_dir, exist_ok=True)
+
+            customers_path = os.path.join(sql_dir, "customers.sql")
+            with open(customers_path, "w", encoding="utf-8") as customers_file:
+                customers_file.write(
+                    textwrap.dedent(
+                        """
+                        SELECT *
+                        FROM (
+                            VALUES (1, 'Alice'), (2, 'Bob')
+                        ) AS t(id, name)
+                        """
+                    ).strip()
+                )
+
+            orders_path = os.path.join(analytics_dir, "orders.sql")
+            with open(orders_path, "w", encoding="utf-8") as orders_file:
+                orders_file.write(
+                    textwrap.dedent(
+                        """
+                        SELECT id, name
+                        FROM customers
+                        """
+                    ).strip()
+                )
+
+            database_path = os.path.join(tmp_dir, "db.duckdb")
+            yato = Yato(
+                database_path=database_path,
+                sql_folder=sql_dir,
+                infer_namespaces=False,
+            )
+
+            con, _ = yato.run()
+            try:
+                customers = con.sql("SELECT COUNT(*) FROM main.customers").fetchone()[0]
+                orders = con.sql(
+                    "SELECT name FROM main.orders ORDER BY id"
+                ).fetchall()
+
+                self.assertEqual(customers, 2)
+                self.assertEqual(orders, [("Alice",), ("Bob",)])
+            finally:
+                con.close()

@@ -22,6 +22,7 @@ def yato_cli(command_string):
         ("--help", "Usage:"),
         ("tests/files/case0", "Running 3 objects..."),
         ("--db mock.duckdb --schema transform tests/files", "Running 6 objects..."),
+        ("--no-infer-namespaces tests/files/case0", "Running 3 objects..."),
     ],
 )
 def test_yato_cli_run(command_string, expected_message_part):
