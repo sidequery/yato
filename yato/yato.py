@@ -10,6 +10,7 @@ from rich.console import Console
 
 from yato.mermaid import generate_mermaid_diagram
 from yato.parser import (
+    Dependency,
     get_dependencies,
     is_select_tree,
     parse_sql,
@@ -59,7 +60,8 @@ class Yato:
         database_path: str,
         sql_folder: str,
         dialect: str = "duckdb",
-        schema: str = "transform",
+        schema: str = "main",
+        infer_namespaces: bool = True,
         db_folder_name: str = "db",
         s3_bucket: str = None,
         s3_access_key: str = None,
@@ -77,7 +79,8 @@ class Yato:
         :param database_path:  The path to the database file (reminder: only DuckDB is supported).
         :param sql_folder: The folder containing the SQL files to run.
         :param dialect: The SQL dialect to use in SQLGlot. Default is DuckDB and only DuckDB is supported.
-        :param schema: The schema to use in the DuckDB database.
+        :param schema: Default schema for SQL files placed directly in the SQL folder. Defaults to 'main'.
+        :param infer_namespaces: If True, derive database/schema from the folder structure (defaults to True).
         :param db_folder_name: The name of the folder to use for backup and restore.
         :param s3_bucket: The S3 bucket to use for backup and restore.
         :param s3_access_key: The S3 access key.
@@ -88,7 +91,8 @@ class Yato:
         self.database_path = database_path
         self.sql_folder = sql_folder
         self.dialect = dialect
-        self.schema = schema
+        self.schema = schema or "main"
+        self.infer_namespaces = infer_namespaces
         self.db_folder_name = db_folder_name
         self.s3_bucket = s3_bucket
         self.s3_access_key = s3_access_key
@@ -148,9 +152,16 @@ class Yato:
         ts = TopologicalSorter({d: dependencies[d].deps for d in dependencies})
         return list(ts.static_order())
 
-    def run_pre_queries(self, context: RunContext) -> None:
-        context.sql(f"CREATE SCHEMA IF NOT EXISTS {self.schema}")
-        context.sql(f"USE {self.schema}")
+    def run_pre_queries(self, context: RunContext, dependencies: dict[str, Dependency]) -> None:
+        schema_names = {self.schema}
+        for dependency in dependencies.values():
+            relation = dependency.relation
+            if relation.database:
+                continue
+            schema_names.add(relation.schema)
+
+        for schema in sorted(schema_names):
+            context.sql(f"CREATE SCHEMA IF NOT EXISTS {schema}")
 
     def run_objects(self, execution_order, dependencies, context: RunContext) -> None:
         context.console.print(f"Running {len(execution_order)} objects...")
@@ -160,28 +171,30 @@ class Yato:
                     context.console.print(f"[green]•[/] Identified {object_name} as a source.")
                     continue
 
-                filename = dependencies[object_name].filename
+                dependency = dependencies[object_name]
+                filename = dependency.filename
                 if os.path.exists(filename) and filename.endswith(".sql"):
                     status.update(f"[bold green]Running SQL {object_name}...")
                     try:
-                        self.run_sql_query(filename, object_name, context)
+                        self.run_sql_query(dependency, context)
                         context.console.print(f"[green]•[/] {object_name} completed.")
                     except Exception as e:
                         context.console.print(f"[red]Error running {object_name}: {e}[/]")
                 elif os.path.exists(filename) and filename.endswith(".py"):
                     status.update(f"[bold green]Running Python {object_name}...")
-                    self.run_python_query(filename, object_name, context)
+                    self.run_python_query(dependency, context)
                     context.console.print(f"[green]•[/] {object_name} completed.")
                 else:
                     context.console.print(f"Identified {object_name} as a source.")
 
-    def run_sql_query(self, filename, table_name, context: RunContext) -> None:
+    def run_sql_query(self, dependency: Dependency, context: RunContext) -> None:
         """
         Runs a SQL query and creates a table in the DuckDB database.
-        :param filename: Name of the SQL file to run.
-        :param table_name: Name of the table to create.
+        :param dependency: Dependency metadata for the file to run.
         :param context: RunContext object.
         """
+        filename = dependency.filename
+        relation = dependency.relation
         sql = read_sql(filename)
         directives = self._extract_directives(sql)
         incremental_key = directives.get("incremental_key")
@@ -195,7 +208,7 @@ class Yato:
             lookback = directives.get("lookback")
             self._run_incremental_model(
                 sql=sql,
-                table_name=table_name,
+                relation=relation,
                 context=context,
                 incremental_key=incremental_key,
                 primary_keys=primary_keys,
@@ -207,22 +220,29 @@ class Yato:
         if len(trees) > 1:
             for tree in trees:
                 if is_select_tree(tree):
-                    context.sql(f"""CREATE OR REPLACE TABLE {self.schema}.{table_name} AS {tree}""")
+                    context.sql(
+                        f"""CREATE OR REPLACE TABLE {self._qualify_relation(relation)} AS {tree}"""
+                    )
                 else:
                     context.sql(f"{tree}")
         else:
-            context.sql(f"""CREATE OR REPLACE TABLE {self.schema}.{table_name} AS {sql}""")
+            context.sql(
+                f"""CREATE OR REPLACE TABLE {self._qualify_relation(relation)} AS {sql}"""
+            )
 
-    def run_python_query(self, filename, table_name, context: RunContext) -> None:
+    def run_python_query(self, dependency: Dependency, context: RunContext) -> None:
         """
         Runs a Python file and creates a table in the DuckDB database.
-        :param filename: Name of the Python file to run.
-        :param table_name: Name of the table to create.
+        :param dependency: Dependency metadata for the file to run.
         :param context: RunContext object.
         """
+        filename = dependency.filename
+        relation = dependency.relation
         instance = read_and_get_python_instance(filename)
         context.con.register("df", instance.run(context))
-        context.sql(f"""CREATE OR REPLACE TABLE {self.schema}.{table_name} AS SELECT * FROM df""")
+        context.sql(
+            f"""CREATE OR REPLACE TABLE {self._qualify_relation(relation)} AS SELECT * FROM df"""
+        )
 
     def _extract_directives(self, sql: str) -> dict:
         directives: dict[str, object] = {}
@@ -330,15 +350,27 @@ class Yato:
                 return nested
         return None
 
-    def _table_exists(self, context: RunContext, table_name: str) -> bool:
-        query = f"""
+    def _table_exists(self, context: RunContext, relation) -> bool:
+        query = """
         SELECT 1
         FROM information_schema.tables
-        WHERE table_schema = '{self.schema}'
-          AND table_name = '{table_name}'
-        LIMIT 1
+        WHERE table_schema = ?
+          AND table_name = ?
         """
-        return context.con.sql(query).fetchone() is not None
+        params = [relation.schema, relation.name]
+        if relation.database:
+            query += " AND table_catalog = ?"
+            params.append(relation.database)
+        query += " LIMIT 1"
+        return context.con.execute(query, params).fetchone() is not None
+
+    def _qualify_relation(self, relation) -> str:
+        parts = []
+        if relation.database:
+            parts.append(self._quote_identifier(relation.database))
+        parts.append(self._quote_identifier(relation.schema))
+        parts.append(self._quote_identifier(relation.name))
+        return ".".join(parts)
 
     @staticmethod
     def _quote_identifier(identifier: str) -> str:
@@ -360,43 +392,50 @@ class Yato:
     def _run_incremental_model(
         self,
         sql: str,
-        table_name: str,
+        relation,
         context: RunContext,
         incremental_key: str,
         primary_keys: list[str],
         lookback: Optional[str] = None,
     ) -> None:
-        target_table = f"{self.schema}.{table_name}"
+        table_label = relation.canonical_name
+        target_table = self._qualify_relation(relation)
         base_query = sql.strip().rstrip(";")
 
-        relation = context.con.sql(f"SELECT * FROM ({base_query}) AS __yato_source LIMIT 0")
-        columns = relation.columns
+        preview = context.con.sql(
+            f"SELECT * FROM ({base_query}) AS __yato_source LIMIT 0"
+        )
+        columns = preview.columns
 
         if not columns:
-            raise ValueError(f"No columns returned for incremental model {table_name}.")
+            raise ValueError(
+                f"No columns returned for incremental model {table_label}."
+            )
 
         column_lookup = {col.lower(): col for col in columns}
 
         incremental_column = column_lookup.get(incremental_key.strip().lower())
         if not incremental_column:
             raise ValueError(
-                f"Incremental key '{incremental_key}' not found in the result set of {table_name}."
+                f"Incremental key '{incremental_key}' not found in the result set of {table_label}."
             )
 
         normalized_primary_keys = [key.strip() for key in primary_keys if key.strip()]
         if not normalized_primary_keys:
-            raise ValueError(f"Primary key not provided for incremental model {table_name}.")
+            raise ValueError(
+                f"Primary key not provided for incremental model {table_label}."
+            )
 
         resolved_primary_keys = []
         for key in normalized_primary_keys:
             resolved = column_lookup.get(key.lower())
             if not resolved:
                 raise ValueError(
-                    f"Primary key column '{key}' not found in the result set of {table_name}."
+                    f"Primary key column '{key}' not found in the result set of {table_label}."
                 )
             resolved_primary_keys.append(resolved)
 
-        if not self._table_exists(context, table_name):
+        if not self._table_exists(context, relation):
             context.sql(f"""CREATE OR REPLACE TABLE {target_table} AS {base_query}""")
             return
 
@@ -526,9 +565,14 @@ class Yato:
         """
         con = duckdb.connect(self.database_path)
         context = RunContext(con)
-        dependencies = get_dependencies(self.sql_folder, self.dialect)
+        dependencies = get_dependencies(
+            self.sql_folder,
+            self.dialect,
+            default_schema=self.schema,
+            infer_namespaces=self.infer_namespaces,
+        )
         execution_order = self.get_execution_order(dependencies)
-        self.run_pre_queries(context)
+        self.run_pre_queries(context, dependencies)
         self.run_objects(execution_order, dependencies, context)
         generate_mermaid_diagram(self.sql_folder, dependencies)
         return con, context

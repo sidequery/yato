@@ -12,7 +12,18 @@ def cli():
 @cli.command()
 @click.argument("sql")
 @click.option("--db", help="Path to the DuckDB database.", default="yato.duckdb", show_default=True)
-@click.option("--schema", help="The schema to use in the DuckDB database.", default="transform")
+@click.option(
+    "--schema",
+    help="Default schema for files placed directly in the SQL folder.",
+    default="main",
+    show_default=True,
+)
+@click.option(
+    "--infer-namespaces/--no-infer-namespaces",
+    help="Infer database/schema from the SQL folder hierarchy.",
+    default=True,
+    show_default=True,
+)
 @click.option(
     "--ui",
     help="Open the local DuckDB UI upon run completion (requires DuckDB >= v1.2.1)",
@@ -20,7 +31,7 @@ def cli():
     default=False,
     show_default=True,
 )
-def run(sql, db, schema, ui):
+def run(sql, db, schema, infer_namespaces, ui):
     """
     Run yato against a DuckDB database using the SQL files.
 
@@ -30,6 +41,7 @@ def run(sql, db, schema, ui):
         database_path=db,
         sql_folder=sql,
         schema=schema,
+        infer_namespaces=infer_namespaces,
     )
 
     try:

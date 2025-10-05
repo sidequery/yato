@@ -27,13 +27,13 @@ yato = Yato(
     # This is the folder where the SQL files are located.
     # The names of the files will determine the name of the table created.
     sql_folder="sql/",
-    # The name of the DuckDB schema where the tables will be created.
-    schema="transform",
 )
 
 # Runs yato against the DuckDB database with the queries in order.
 yato.run()
 ```
+
+By default yato infers the target schema from your folder structure—files at the root land in the configured default schema ("main" unless overridden) while nested folders name schemas or databases—so most projects can omit the explicit `schema` argument altogether.
 
 You can also run yato with the cli:
 
@@ -52,7 +52,6 @@ from yato import Yato
 yato = Yato(
     database_path="db.duckdb",
     sql_folder="sql/",
-    schema="transform",
 )
 
 # You restore the database from S3 before runnning dlt
@@ -127,7 +126,7 @@ On the very first run the table is created with a `CREATE OR REPLACE TABLE ... A
 If the DuckDB version bundled with your environment does not yet support `MERGE`, yato falls back to a delete-and-insert strategy that preserves the same semantics.
 
 ### Other features
-* **Subfolders** — in the main folder, just create the folders you want to organise your transformations, folders have no impact on the DAG inference. Be careful not to have 2 transformations with the same name.
+* **Folder-driven namespaces** — the relative path of each SQL file determines the DuckDB location for the resulting table. Files placed directly in the root folder are created in the default schema (`main` unless you override `schema` when instantiating `Yato`). A single nested folder names the schema (for example `staging/orders.sql` becomes `staging.orders`). Two nested folders designate the database and schema (for example `warehouse/analytics/orders.sql` creates `warehouse.analytics.orders`). Nesting deeper than two folders is not supported, and references across schemas must be fully qualified in SQL. You can opt out of this behaviour by setting `infer_namespaces=False` when creating `Yato` (or `--no-infer-namespaces` on the CLI); in that mode every model is created inside the default schema regardless of its subdirectory.
 * **Multiple SQL statements** — in the same file, yato will run them in the order they appear. Warning: you can only have one SELECT statement. Other statements can be SET, etc. Still the dependencies (hence the DAG) are computed on the SELECT only for the moment.
 
 
