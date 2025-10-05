@@ -2,13 +2,20 @@ import logging
 import os
 import re
 import tempfile
+from typing import Iterable, Optional
 from graphlib import TopologicalSorter
 
 import duckdb
 from rich.console import Console
 
 from yato.mermaid import generate_mermaid_diagram
-from yato.parser import get_dependencies, is_select_tree, parse_sql, read_and_get_python_instance, read_sql
+from yato.parser import (
+    get_dependencies,
+    is_select_tree,
+    parse_sql,
+    read_and_get_python_instance,
+    read_sql,
+)
 from yato.storage import Storage
 
 logger = logging.getLogger(__name__)
@@ -176,6 +183,26 @@ class Yato:
         :param context: RunContext object.
         """
         sql = read_sql(filename)
+        directives = self._extract_directives(sql)
+        incremental_key = directives.get("incremental_key")
+        primary_keys = directives.get("primary_key") or directives.get("unique_key")
+
+        if incremental_key and primary_keys:
+            if isinstance(primary_keys, str):
+                primary_keys = [
+                    key.strip() for key in primary_keys.split(",") if key.strip()
+                ]
+            lookback = directives.get("lookback")
+            self._run_incremental_model(
+                sql=sql,
+                table_name=table_name,
+                context=context,
+                incremental_key=incremental_key,
+                primary_keys=primary_keys,
+                lookback=lookback,
+            )
+            return
+
         trees = parse_sql(sql, dialect=self.dialect)
         if len(trees) > 1:
             for tree in trees:
@@ -196,6 +223,299 @@ class Yato:
         instance = read_and_get_python_instance(filename)
         context.con.register("df", instance.run(context))
         context.sql(f"""CREATE OR REPLACE TABLE {self.schema}.{table_name} AS SELECT * FROM df""")
+
+    def _extract_directives(self, sql: str) -> dict:
+        directives: dict[str, object] = {}
+        trees = parse_sql(sql, dialect=self.dialect)
+
+        def record_list(key: str, values: Iterable[str]) -> None:
+            existing = directives.get(key)
+            if existing is None:
+                existing_list: list[str] = []
+            elif isinstance(existing, list):
+                existing_list = existing
+            elif isinstance(existing, str):
+                existing_list = [existing]
+            else:
+                existing_list = []
+            directives[key] = existing_list
+            for value in values:
+                if value and value not in existing_list:
+                    existing_list.append(value)
+
+        known_directives = {"incremental_key", "primary_key", "unique_key", "lookback"}
+
+        def parse_comment(raw_comment: str, node_label: Optional[str] = None) -> None:
+            cleaned = raw_comment.strip().lstrip("-").strip()
+            if not cleaned:
+                return
+
+            fragments = [part.strip() for part in cleaned.split(",") if part.strip()]
+            pending_key: Optional[str] = None
+            pending_value = ""
+
+            def finalize(key: str, value: str) -> None:
+                directive = key.strip().lower()
+                if directive not in known_directives:
+                    return
+                value = value.strip()
+                if directive == "incremental_key":
+                    target = value or node_label
+                    if target:
+                        directives[directive] = target
+                elif directive in {"primary_key", "unique_key"}:
+                    values = [v.strip() for v in value.split(",") if v.strip()] if value else []
+                    if not values and node_label:
+                        values = [node_label]
+                    record_list(directive, values)
+                elif directive == "lookback":
+                    target = value or node_label
+                    if target:
+                        directives[directive] = target
+
+            for fragment in fragments:
+                if ":" in fragment:
+                    key, value = fragment.split(":", 1)
+                    if pending_key:
+                        finalize(pending_key, pending_value)
+                    pending_key = key
+                    pending_value = value
+                else:
+                    candidate = fragment.strip()
+                    lower_candidate = candidate.lower()
+                    if lower_candidate in known_directives:
+                        if pending_key:
+                            finalize(pending_key, pending_value)
+                        pending_key = candidate
+                        pending_value = ""
+                    elif pending_key:
+                        addition = fragment.strip()
+                        if addition:
+                            pending_value = (
+                                f"{pending_value}, {addition}" if pending_value else addition
+                            )
+
+            if pending_key:
+                finalize(pending_key, pending_value)
+
+        for tree in trees:
+            for comment in getattr(tree, "comments", []) or []:
+                parse_comment(comment)
+
+            for node in tree.walk():
+                comments = getattr(node, "comments", None)
+                if not comments:
+                    continue
+                node_label = self._infer_expression_label(node)
+                for comment in comments:
+                    parse_comment(comment, node_label=node_label)
+
+        return directives
+
+    @staticmethod
+    def _infer_expression_label(node) -> Optional[str]:
+        alias = getattr(node, "alias", None)
+        if alias:
+            return alias
+        alias_or_name = getattr(node, "alias_or_name", None)
+        if alias_or_name:
+            return alias_or_name
+        name = getattr(node, "name", None)
+        if name:
+            return name
+        base = getattr(node, "this", None)
+        if base is not None and base is not node:
+            nested = Yato._infer_expression_label(base)
+            if nested:
+                return nested
+        return None
+
+    def _table_exists(self, context: RunContext, table_name: str) -> bool:
+        query = f"""
+        SELECT 1
+        FROM information_schema.tables
+        WHERE table_schema = '{self.schema}'
+          AND table_name = '{table_name}'
+        LIMIT 1
+        """
+        return context.con.sql(query).fetchone() is not None
+
+    @staticmethod
+    def _quote_identifier(identifier: str) -> str:
+        if identifier.startswith('"') and identifier.endswith('"'):
+            return identifier
+        return '"' + identifier.replace('"', '""') + '"'
+
+    @staticmethod
+    def _prepare_lookback_expression(raw_value: Optional[str]) -> Optional[str]:
+        if not raw_value:
+            return None
+        value = raw_value.strip()
+        interval_match = re.match(r"^(\d+)\s*(\w+)$", value)
+        if interval_match:
+            amount, unit = interval_match.groups()
+            return f"INTERVAL '{amount}' {unit.upper()}"
+        return value
+
+    def _run_incremental_model(
+        self,
+        sql: str,
+        table_name: str,
+        context: RunContext,
+        incremental_key: str,
+        primary_keys: list[str],
+        lookback: Optional[str] = None,
+    ) -> None:
+        target_table = f"{self.schema}.{table_name}"
+        base_query = sql.strip().rstrip(";")
+
+        relation = context.con.sql(f"SELECT * FROM ({base_query}) AS __yato_source LIMIT 0")
+        columns = relation.columns
+
+        if not columns:
+            raise ValueError(f"No columns returned for incremental model {table_name}.")
+
+        column_lookup = {col.lower(): col for col in columns}
+
+        incremental_column = column_lookup.get(incremental_key.strip().lower())
+        if not incremental_column:
+            raise ValueError(
+                f"Incremental key '{incremental_key}' not found in the result set of {table_name}."
+            )
+
+        normalized_primary_keys = [key.strip() for key in primary_keys if key.strip()]
+        if not normalized_primary_keys:
+            raise ValueError(f"Primary key not provided for incremental model {table_name}.")
+
+        resolved_primary_keys = []
+        for key in normalized_primary_keys:
+            resolved = column_lookup.get(key.lower())
+            if not resolved:
+                raise ValueError(
+                    f"Primary key column '{key}' not found in the result set of {table_name}."
+                )
+            resolved_primary_keys.append(resolved)
+
+        if not self._table_exists(context, table_name):
+            context.sql(f"""CREATE OR REPLACE TABLE {target_table} AS {base_query}""")
+            return
+
+        quoted_incremental = self._quote_identifier(incremental_column)
+        lookback_expr = self._prepare_lookback_expression(lookback)
+        max_expression = f"MAX({quoted_incremental})"
+        if lookback_expr:
+            max_expression = f"{max_expression} - {lookback_expr}"
+
+        quoted_primary_keys = [self._quote_identifier(col) for col in resolved_primary_keys]
+        primary_key_set = {pk.lower() for pk in resolved_primary_keys}
+        update_columns = [col for col in columns if col.lower() not in primary_key_set]
+        update_clause = ""
+        if update_columns:
+            assignments = ", ".join(
+                [
+                    f"target.{self._quote_identifier(col)} = source.{self._quote_identifier(col)}"
+                    for col in update_columns
+                ]
+            )
+            update_clause = f"\nWHEN MATCHED THEN UPDATE SET {assignments}"
+
+        insert_columns = ", ".join(self._quote_identifier(col) for col in columns)
+        insert_values = ", ".join(f"source.{self._quote_identifier(col)}" for col in columns)
+        filter_clause = (
+            "\n            WHERE "
+            + f"{quoted_incremental} >= COALESCE("
+            + "\n                (SELECT "
+            + f"{max_expression} FROM {target_table}),"
+            + "\n                (SELECT MIN("
+            + f"{quoted_incremental}) FROM source_data)"
+            + "\n            )"
+            + "\n        "
+        )
+
+        source_cte = f"""
+        WITH source_data AS (
+            {base_query}
+        ),
+        filtered AS (
+            SELECT *
+            FROM source_data
+            {filter_clause}
+        )
+        """
+
+        on_conditions = " AND ".join(
+            [f"target.{col} = source.{col}" for col in quoted_primary_keys]
+        )
+
+        merge_sql = f"""
+        {source_cte}
+        MERGE INTO {target_table} AS target
+        USING filtered AS source
+        ON {on_conditions}
+        {update_clause}
+        WHEN NOT MATCHED THEN INSERT ({insert_columns})
+        VALUES ({insert_values})
+        """
+
+        try:
+            context.sql(merge_sql)
+        except duckdb.Error as exc:
+            if "MERGE" not in str(exc).upper():
+                raise
+            self._run_incremental_without_merge(
+                context=context,
+                target_table=target_table,
+                source_cte=source_cte,
+                columns=columns,
+                quoted_primary_keys=quoted_primary_keys,
+            )
+
+    def _run_incremental_without_merge(
+        self,
+        context: RunContext,
+        target_table: str,
+        source_cte: str,
+        columns: list[str],
+        quoted_primary_keys: list[str],
+    ) -> None:
+        temp_table = "__yato_incremental"
+        select_columns = ", ".join(
+            f"source.{self._quote_identifier(col)}" for col in columns
+        )
+        create_temp_sql = f"""
+        CREATE OR REPLACE TEMP TABLE {temp_table} AS
+        {source_cte}
+        SELECT *
+        FROM filtered
+        """
+
+        context.sql(create_temp_sql)
+
+        try:
+            delete_conditions = " AND ".join(
+                [f"{col} = source.{col}" for col in quoted_primary_keys]
+            )
+            delete_sql = f"""
+            DELETE FROM {target_table}
+            WHERE EXISTS (
+                SELECT 1
+                FROM {temp_table} AS source
+                WHERE {delete_conditions}
+            )
+            """
+
+            context.sql(delete_sql)
+
+            insert_columns = ", ".join(self._quote_identifier(col) for col in columns)
+            insert_sql = f"""
+            INSERT INTO {target_table} ({insert_columns})
+            SELECT {select_columns}
+            FROM {temp_table} AS source
+            """
+
+            context.sql(insert_sql)
+        finally:
+            context.sql(f"DROP TABLE IF EXISTS {temp_table}")
 
     def run(self) -> object:
         """

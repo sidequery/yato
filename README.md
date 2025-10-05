@@ -108,6 +108,24 @@ yato supports env variables in the SQL queries (like in the example below). Be c
 SELECT {{ VALUE }}, {{ OTHER_VALUE }}
 ```
 
+### Incremental models
+You can mark a SQL file as incremental by annotating it with inline comments. yato reads those comments using SQLGlot and automatically switches to an incremental `MERGE` strategy when the target table already exists.
+
+```sql
+SELECT
+    id -- primary_key
+  , updated_at -- incremental_key, lookback: 1 day
+  , payload
+FROM staging_orders
+```
+
+* `incremental_key` — add `-- incremental_key` (optionally followed by `: column_name`) to the column expression that represents the incremental cursor. The next run only processes rows whose incremental key is greater than or equal to the latest stored value.
+* `primary_key` (or `unique_key`) — annotate each column that participates in the primary key with `-- primary_key`. You can also specify multiple keys explicitly with `-- primary_key: id, other_id` if you prefer.
+* `lookback` (optional) — include `lookback: value` alongside the incremental key comment (for example `-- incremental_key, lookback: 1 day`). The incremental window starts at `MAX(incremental_key) - lookback`, which is helpful when upstream data is late arriving.
+
+On the very first run the table is created with a `CREATE OR REPLACE TABLE ... AS SELECT ...`. Subsequent runs issue a DuckDB `MERGE INTO` statement that updates existing rows and inserts new rows.
+If the DuckDB version bundled with your environment does not yet support `MERGE`, yato falls back to a delete-and-insert strategy that preserves the same semantics.
+
 ### Other features
 * **Subfolders** — in the main folder, just create the folders you want to organise your transformations, folders have no impact on the DAG inference. Be careful not to have 2 transformations with the same name.
 * **Multiple SQL statements** — in the same file, yato will run them in the order they appear. Warning: you can only have one SELECT statement. Other statements can be SET, etc. Still the dependencies (hence the DAG) are computed on the SELECT only for the moment.
